@@ -1,0 +1,4 @@
+interface:
+  display_name: "Celery Redis Worker"
+  short_description: "Add Celery tasks and Redis queue flows"
+  default_prompt: "Use this skill when creating or updating Celery tasks, beat schedules, Redis-backed task workflows, or async-to-sync task bridges in this repository."

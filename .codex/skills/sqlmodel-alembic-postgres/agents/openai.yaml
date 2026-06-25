@@ -1,0 +1,4 @@
+interface:
+  display_name: "SQLModel Alembic Postgres"
+  short_description: "Model SQLModel schemas and Alembic migrations"
+  default_prompt: "Use this skill when changing app/models.py, writing SQLModel CRUD, adding enum label fields, or creating Alembic migrations in this repository."

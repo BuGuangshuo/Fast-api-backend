@@ -1,0 +1,4 @@
+interface:
+  display_name: "Requirement Bridge"
+  short_description: "Normalize raw requirements into prompts or requirement docs"
+  default_prompt: "Use this skill when you need to turn a chat request, a task list, or a markdown requirement file into either a clearer executable prompt package or a formal `requirements/*.md` document. Default to `normalize-to-prompt`, and use `rewrite-to-requirement-md` when the user explicitly wants a structured requirement markdown output."

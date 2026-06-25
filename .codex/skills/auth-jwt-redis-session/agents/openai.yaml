@@ -1,0 +1,4 @@
+interface:
+  display_name: "Auth JWT Redis Session"
+  short_description: "Maintain JWT auth with Redis session checks"
+  default_prompt: "Use this skill when changing login, token validation, Redis session keys, logout, current-user dependencies, or permission checks in this repository."

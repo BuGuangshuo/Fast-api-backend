@@ -1,0 +1,4 @@
+interface:
+  display_name: "FastAPI Service CRUD"
+  short_description: "Build FastAPI router-service-CRUD flows"
+  default_prompt: "Use this skill when adding or modifying API endpoints, service orchestration, CRUD queries, pagination, options endpoints, or response schemas in this repository."

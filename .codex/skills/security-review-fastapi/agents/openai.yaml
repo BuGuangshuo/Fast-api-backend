@@ -1,0 +1,4 @@
+interface:
+  display_name: "Security Review FastAPI"
+  short_description: "Review FastAPI auth upload and task risks"
+  default_prompt: "Use this skill when performing a security review of authentication, uploads, file handling, Celery jobs, Redis usage, or API error handling in this repository."

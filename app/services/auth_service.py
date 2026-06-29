@@ -68,7 +68,9 @@ async def create_login_session(
         user_id, refresh_delta, AuthTokenType.REFRESH_TOKEN
     )
 
-    await redis.set(RedisKey.access_token(user_id), access_token, _seconds(access_delta))
+    await redis.set(
+        RedisKey.access_token(user_id), access_token, _seconds(access_delta)
+    )
     await redis.set(
         RedisKey.refresh_token(user_id), refresh_token, _seconds(refresh_delta)
     )
@@ -141,9 +143,7 @@ async def logout_login_session(*, redis: RedisService, user: User) -> None:
     await redis.delete(RedisKey.refresh_token(user_id))
 
 
-async def get_login_session(
-    *, redis: RedisService, user: User
-) -> AuthSessionResponse:
+async def get_login_session(*, redis: RedisService, user: User) -> AuthSessionResponse:
     """返回当前登录会话 TTL 信息。"""
     user_id = str(user.id)
     access_ttl = await redis.ttl(RedisKey.access_token(user_id))

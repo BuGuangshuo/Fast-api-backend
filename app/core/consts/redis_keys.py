@@ -11,6 +11,11 @@ class RedisKey:
         return f"framework:cache:{key}"
 
     @staticmethod
+    def ai_chat_session(user_id: str, session_id: str) -> str:
+        """当前用户的 AI 对话临时历史。"""
+        return f"ai_chat:session:{user_id}:{session_id}"
+
+    @staticmethod
     def access_token(user_id: str) -> str:
         """当前有效 access token。
 

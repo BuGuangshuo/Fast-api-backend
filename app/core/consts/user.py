@@ -9,4 +9,3 @@ class UserMsg:
     NOT_FOUND = "用户不存在"
     USERNAME_EXISTS = "用户名已存在"
     EMAIL_EXISTS = "邮箱已存在"
-

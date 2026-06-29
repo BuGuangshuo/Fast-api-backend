@@ -15,7 +15,6 @@ from app.core.redis import RedisService, get_redis_service
 from app.core.security import decode_token_payload
 from app.models import User
 
-
 oauth2_scheme = OAuth2PasswordBearer(
     tokenUrl=f"{settings.API_V1_STR}/login/access-token"
 )

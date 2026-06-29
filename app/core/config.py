@@ -90,6 +90,11 @@ class Settings(BaseSettings):
     REDIS_SOCKET_CONNECT_TIMEOUT: int = 30
     REDIS_RETRY_ON_TIMEOUT: bool = True
     CACHE_DEFAULT_TTL: int = 604800
+    LLM_API_BASE_URL: str = "http://127.0.0.1:1104/v1"
+    LLM_API_KEY: str = "107815"
+    LLM_CHAT_MODEL: str = "Qwen3.5-9B-4bit"
+    LLM_CHAT_SESSION_TTL_SECONDS: int = 86400
+    LLM_CHAT_MAX_HISTORY_MESSAGES: int = 20
 
     @computed_field  # type: ignore[prop-decorator]
     @property

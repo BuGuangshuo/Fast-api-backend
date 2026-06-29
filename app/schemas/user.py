@@ -5,7 +5,6 @@ from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
 
-
 # ==================== API Request/Response Schemas ====================
 
 
@@ -37,4 +36,3 @@ class UserPublic(BaseModel):
     created_at: datetime
     updated_at: datetime
     last_login_at: datetime | None = None
-

@@ -1,10 +1,16 @@
 """Schema exports."""
 
 from app.schemas.ai_chat import (
+    AIChatAttachment,
+    AIChatConversationListItem,
+    AIChatConversationMessagePublic,
+    AIChatConversationResponse,
+    AIChatConversationUpdateRequest,
     AIChatMessage,
     AIChatSessionCreatedResponse,
     AIChatSessionResponse,
     AIChatStreamRequest,
+    AIChatThinkingMode,
 )
 from app.schemas.common import (
     Message,
@@ -25,9 +31,15 @@ from app.schemas.user import UserCreate, UserPublic
 
 __all__ = [
     "AIChatMessage",
+    "AIChatAttachment",
+    "AIChatConversationListItem",
+    "AIChatConversationMessagePublic",
+    "AIChatConversationResponse",
+    "AIChatConversationUpdateRequest",
     "AIChatSessionCreatedResponse",
     "AIChatSessionResponse",
     "AIChatStreamRequest",
+    "AIChatThinkingMode",
     "AuthSessionResponse",
     "LoginRequest",
     "Message",

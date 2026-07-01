@@ -32,6 +32,7 @@ dependencies = [
     "loguru>=0.7.0",
     "celery[redis]>=5.4.0,<6.0.0",
     "flower>=2.0.0,<3.0.0",
+    "pypdf>=5.0.0,<7.0.0",
 ]
 
 # 这是 uv 工具的开发环境依赖配置

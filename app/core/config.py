@@ -95,6 +95,9 @@ class Settings(BaseSettings):
     LLM_CHAT_MODEL: str = "Qwen3.5-9B-4bit"
     LLM_CHAT_SESSION_TTL_SECONDS: int = 86400
     LLM_CHAT_MAX_HISTORY_MESSAGES: int = 20
+    LLM_CHAT_MAX_UPLOAD_FILES: int = 20
+    LLM_CHAT_MAX_UPLOAD_BYTES: int = 20 * 1024 * 1024
+    LLM_CHAT_MAX_TEXT_FILE_BYTES: int = 512 * 1024
 
     @computed_field  # type: ignore[prop-decorator]
     @property

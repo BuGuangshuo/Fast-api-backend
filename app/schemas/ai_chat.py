@@ -11,11 +11,23 @@ from pydantic import BaseModel, Field
 AIChatThinkingMode = Literal["auto", "thinking", "fast"]
 
 
+class AIChatAttachmentPublic(BaseModel):
+    """AI 对话历史中的附件展示信息。"""
+
+    filename: str = Field(description="文件名或文件夹相对路径")
+    content_type: str | None = Field(default=None, description="MIME 类型")
+    size: int = Field(ge=0, description="文件大小，单位字节")
+
+
 class AIChatMessage(BaseModel):
     """AI 对话消息。"""
 
     role: Literal["system", "user", "assistant"] = Field(description="消息角色")
     content: str = Field(min_length=1, description="消息内容")
+    attachments: list[AIChatAttachmentPublic] = Field(
+        default_factory=list,
+        description="消息关联的附件展示信息",
+    )
 
 
 class AIChatAttachment(BaseModel):
@@ -49,7 +61,7 @@ class AIChatStreamRequest(BaseModel):
     )
     attachments: list[AIChatAttachment] = Field(
         default_factory=list,
-        description="本轮随消息上传的附件，仅参与当前请求，不写入会话历史",
+        description="本轮随消息上传的附件，历史中仅保留文件名、类型和大小",
     )
 
     @property
@@ -108,6 +120,11 @@ class AIChatConversationMessagePublic(BaseModel):
     id: uuid.UUID = Field(description="消息 ID")
     role: Literal["user", "assistant"] = Field(description="消息角色")
     content: str = Field(description="消息内容")
+    attachments: list[AIChatAttachmentPublic] = Field(
+        default_factory=list,
+        description="消息关联的附件展示信息",
+    )
+    reasoning_title: str | None = Field(default=None, description="模型思考标题")
     reasoning_content: str | None = Field(default=None, description="模型思考内容")
     created_at: datetime = Field(description="创建时间")
 

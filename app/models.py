@@ -7,8 +7,9 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime, timezone
+from typing import Any
 
-from sqlalchemy import Column, Text
+from sqlalchemy import JSON, Column, Text
 from sqlmodel import Field, SQLModel
 
 
@@ -72,7 +73,10 @@ class AIChatConversation(AIChatConversationBase, table=True):
 
 
 class AIChatConversationMessageBase(SQLModel):
-    """AI 对话消息基础字段，仅保存问答正文，不持久化本轮附件内容。"""
+    """AI 对话消息基础字段。
+
+    附件只保存用于历史展示的元数据，不持久化文本正文、图片 base64 等本轮内容。
+    """
 
     conversation_id: uuid.UUID = Field(
         foreign_key="ai_chat_conversations.id",
@@ -80,6 +84,10 @@ class AIChatConversationMessageBase(SQLModel):
     )
     role: str = Field(max_length=16)
     content: str = Field(sa_column=Column(Text, nullable=False))
+    attachments: list[dict[str, Any]] = Field(
+        default_factory=list,
+        sa_column=Column(JSON, nullable=False),
+    )
     reasoning_content: str | None = Field(
         default=None,
         sa_column=Column(Text, nullable=True),

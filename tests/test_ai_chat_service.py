@@ -208,7 +208,7 @@ def test_stream_ai_chat_creates_session_and_saves_history(
     assert "event: session" in events[0]
     assert 'event: delta\ndata: {"content": "你"}' in events[1]
     assert 'event: done\ndata: {"session_id":' in events[-1]
-    assert captured_payloads[0]["model"] == "Qwen3.5-9B-4bit"
+    assert captured_payloads[0]["model"] == "Qwen3.5-9B-MLX-4bit"
     assert captured_payloads[0]["stream"] is True
     assert captured_payloads[0]["messages"][-1] == {"role": "user", "content": "你好"}
     assert captured_headers[0]["Authorization"] == "Bearer test-api-key"
@@ -489,6 +489,90 @@ def test_stream_ai_chat_includes_text_attachment_context(
     assert isinstance(user_message, str)
     assert "docs/readme.md" in user_message
     assert "# 标题\n内容" in user_message
+
+
+def test_stream_ai_chat_persists_attachment_metadata_for_history(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeAsyncClient:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        async def __aenter__(self) -> "FakeAsyncClient":
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            return None
+
+        def stream(
+            self,
+            method: str,
+            url: str,
+            json: dict[str, Any],
+            headers: dict[str, str],
+        ) -> FakeStreamResponse:
+            _ = (method, url, json, headers)
+            return FakeStreamResponse(
+                [
+                    'data: {"choices":[{"delta":{"content":"收到"}}]}',
+                    "data: [DONE]",
+                ]
+            )
+
+        async def post(
+            self,
+            url: str,
+            json: dict[str, Any],
+            headers: dict[str, str],
+        ) -> FakeJSONResponse:
+            _ = (url, json, headers)
+            return FakeJSONResponse({"choices": [{"message": {"content": "附件对话"}}]})
+
+    monkeypatch.setattr(ai_chat_service.httpx, "AsyncClient", FakeAsyncClient)
+    session = _db_session()
+    redis = FakeRedis()
+    user = _user()
+
+    events = asyncio.run(
+        _collect_stream(
+            redis,
+            user,
+            AIChatStreamRequest(
+                message="总结附件",
+                attachments=[
+                    {
+                        "filename": "docs/readme.md",
+                        "content_type": "text/markdown",
+                        "size": 11,
+                        "text": "# 标题\n内容",
+                    }
+                ],
+            ),
+            session=session,
+        )
+    )
+    session_id = events[0].split('"session_id": "')[1].split('"')[0]
+
+    detail = get_ai_chat_conversation_service(
+        session=session,
+        current_user=user,
+        conversation_id=uuid.UUID(session_id),
+    )
+    assert detail.messages[0].attachments[0].model_dump() == {
+        "filename": "docs/readme.md",
+        "content_type": "text/markdown",
+        "size": 11,
+    }
+
+    session_detail = asyncio.run(
+        get_ai_chat_session_service(
+            session=session,
+            redis=redis,
+            current_user=user,
+            session_id=session_id,
+        )
+    )
+    assert session_detail.messages[0].attachments[0].filename == "docs/readme.md"
 
 
 def test_stream_ai_chat_includes_image_attachment_part(
@@ -869,8 +953,13 @@ def test_stream_ai_chat_auto_mode_emits_reasoning_when_upstream_returns_it(
         )
     )
 
-    assert 'event: reasoning\ndata: {"content": "自动分析"}' in events[1]
+    assert (
+        'event: reasoning\ndata: {"content": "自动分析", '
+        '"reasoning_title": null, "reasoning_content": "自动分析"}'
+    ) in events[1]
     assert '"reasoning": "自动分析"' in events[-1]
+    assert '"reasoning_title": null' in events[-1]
+    assert '"reasoning_content": "自动分析"' in events[-1]
 
 
 def test_stream_ai_chat_emits_reasoning_when_thinking_enabled(
@@ -912,15 +1001,90 @@ def test_stream_ai_chat_emits_reasoning_when_thinking_enabled(
         )
     )
 
-    assert 'event: reasoning\ndata: {"content": "先分析"}' in events[1]
+    assert (
+        'event: reasoning\ndata: {"content": "先分析", '
+        '"reasoning_title": null, "reasoning_content": "先分析"}'
+    ) in events[1]
     assert 'event: delta\ndata: {"content": "答案"}' in events[2]
     assert '"reasoning": "先分析"' in events[-1]
+    assert '"reasoning_title": null' in events[-1]
+    assert '"reasoning_content": "先分析"' in events[-1]
 
     history = next(iter(redis.store.values()))
     assert history == [
         {"role": "user", "content": "hello"},
         {"role": "assistant", "content": "答案"},
     ]
+
+
+def test_stream_ai_chat_splits_reasoning_title_and_content(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeAsyncClient:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        async def __aenter__(self) -> "FakeAsyncClient":
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            return None
+
+        def stream(
+            self,
+            method: str,
+            url: str,
+            json: dict[str, Any],
+            headers: dict[str, str],
+        ) -> FakeStreamResponse:
+            _ = (method, url, json, headers)
+            return FakeStreamResponse(
+                [
+                    'data: {"choices":[{"delta":{"reasoning_content":"# 思考摘要\\n"}}]}',
+                    'data: {"choices":[{"delta":{"reasoning_content":"先判断问题，再组织回答"}}]}',
+                    'data: {"choices":[{"delta":{"content":"答案"}}]}',
+                    "data: [DONE]",
+                ]
+            )
+
+        async def post(
+            self,
+            url: str,
+            json: dict[str, Any],
+            headers: dict[str, str],
+        ) -> FakeJSONResponse:
+            _ = (url, json, headers)
+            return FakeJSONResponse({"choices": [{"message": {"content": "思考拆分"}}]})
+
+    monkeypatch.setattr(ai_chat_service.httpx, "AsyncClient", FakeAsyncClient)
+    session = _db_session()
+    user = _user()
+
+    events = asyncio.run(
+        _collect_stream(
+            FakeRedis(),
+            user,
+            AIChatStreamRequest(message="hello", enable_thinking=True),
+            session=session,
+        )
+    )
+    session_id = events[0].split('"session_id": "')[1].split('"')[0]
+
+    assert '"reasoning_title": "思考摘要"' in events[1]
+    assert '"reasoning_content": ""' in events[1]
+    assert '"reasoning_title": "思考摘要"' in events[2]
+    assert '"reasoning_content": "先判断问题，再组织回答"' in events[2]
+    assert '"reasoning": "# 思考摘要\\n先判断问题，再组织回答"' in events[-1]
+    assert '"reasoning_title": "思考摘要"' in events[-1]
+    assert '"reasoning_content": "先判断问题，再组织回答"' in events[-1]
+
+    detail = get_ai_chat_conversation_service(
+        session=session,
+        current_user=user,
+        conversation_id=uuid.UUID(session_id),
+    )
+    assert detail.messages[1].reasoning_title == "思考摘要"
+    assert detail.messages[1].reasoning_content == "先判断问题，再组织回答"
 
 
 def test_stream_ai_chat_hides_reasoning_when_thinking_disabled(

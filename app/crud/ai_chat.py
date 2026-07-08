@@ -1,6 +1,7 @@
 """AI 对话 CRUD 操作。"""
 
 import uuid
+from typing import Any
 
 from sqlalchemy import func
 from sqlmodel import Session, col, select
@@ -89,6 +90,7 @@ def append_ai_chat_exchange(
     title: str,
     user_message: str,
     assistant_message: str,
+    user_attachments: list[dict[str, Any]] | None = None,
     reasoning_content: str | None = None,
 ) -> AIChatConversation:
     """写入一轮完整 user / assistant 问答。
@@ -126,6 +128,7 @@ def append_ai_chat_exchange(
             conversation_id=conversation_id,
             role="user",
             content=user_message,
+            attachments=user_attachments or [],
             sort_order=next_order,
             created_at=now,
         )

@@ -27,6 +27,7 @@ from app.core.redis import RedisService
 from app.models import User
 from app.schemas import (
     AIChatAttachment,
+    AIChatAttachmentPublic,
     AIChatConversationListItem,
     AIChatConversationMessagePublic,
     AIChatConversationResponse,
@@ -145,6 +146,12 @@ _GENERIC_TITLE_VALUES = {
     "对话标题",
 }
 _PERSISTENT_MESSAGE_ROLES = {"user", "assistant"}
+_REASONING_HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s+(?P<title>.+?)\s*#*\s*$")
+_REASONING_LABEL_RE = re.compile(
+    r"^\s*(?:思考标题|标题|title)\s*[:：]\s*(?P<title>.+?)\s*$",
+    flags=re.IGNORECASE,
+)
+_REASONING_BOLD_RE = re.compile(r"^\s*\*\*(?P<title>[^*]+?)\*\*\s*$")
 
 
 class _AIChatUpstreamError(Exception):
@@ -183,6 +190,98 @@ def _parse_conversation_id(session_id: str | None) -> uuid.UUID | None:
 def _sse_event(event: str, data: dict[str, Any]) -> str:
     payload = json.dumps(data, ensure_ascii=False)
     return f"event: {event}\ndata: {payload}\n\n"
+
+
+def _normalize_reasoning_title(title: str) -> str:
+    """清理模型思考标题周围的 Markdown / 引号噪声。"""
+    return re.sub(r"\s+", " ", title).strip(" \t#*`\"'“”《》【】[]()（）")
+
+
+def _split_reasoning_title_and_content(
+    reasoning_content: str | None,
+) -> tuple[str | None, str | None]:
+    """将模型 reasoning 中的首行标题拆给前端展示。
+
+    数据库存量仍保存原始 reasoning；这里仅在出接口时识别常见的 Markdown 标题、
+    “标题：...” 和加粗标题，避免前端重复解析模型格式。
+    """
+    if reasoning_content is None:
+        return None, None
+
+    text = reasoning_content.strip()
+    if not text:
+        return None, None
+
+    lines = text.splitlines()
+    first_line_index = next(
+        (index for index, line in enumerate(lines) if line.strip()),
+        None,
+    )
+    if first_line_index is None:
+        return None, None
+
+    first_line = lines[first_line_index].strip()
+    title = None
+    for pattern in (_REASONING_HEADING_RE, _REASONING_LABEL_RE, _REASONING_BOLD_RE):
+        match = pattern.match(first_line)
+        if match is not None:
+            title = _normalize_reasoning_title(match.group("title"))
+            break
+
+    if not title:
+        return None, text
+
+    body = "\n".join(lines[first_line_index + 1 :]).strip()
+    return title, body
+
+
+def _reasoning_payload_fields(reasoning_content: str | None) -> dict[str, str | None]:
+    """生成前端可直接使用的 reasoning 标题和正文。"""
+    reasoning_title, parsed_content = _split_reasoning_title_and_content(
+        reasoning_content
+    )
+    return {
+        "reasoning_title": reasoning_title,
+        "reasoning_content": parsed_content,
+    }
+
+
+def _attachment_public_metadata(
+    attachments: list[AIChatAttachment],
+) -> list[AIChatAttachmentPublic]:
+    """保留历史展示需要的附件元数据，不保存正文或图片 data URL。"""
+    return [
+        AIChatAttachmentPublic(
+            filename=attachment.filename,
+            content_type=attachment.content_type,
+            size=attachment.size,
+        )
+        for attachment in attachments
+    ]
+
+
+def _coerce_attachment_metadata(value: Any) -> list[AIChatAttachmentPublic]:
+    """兼容旧数据或异常 JSON，只返回前端可展示的附件元数据。"""
+    if not isinstance(value, list):
+        return []
+
+    attachments: list[AIChatAttachmentPublic] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        try:
+            attachments.append(AIChatAttachmentPublic.model_validate(item))
+        except ValidationError:
+            logger.warning("忽略异常 AI 对话附件元数据: %s", item)
+    return attachments
+
+
+def _history_message_dump(message: AIChatMessage) -> dict[str, Any]:
+    """缓存历史时保留非空附件，避免旧格式里出现大量空列表。"""
+    data = message.model_dump()
+    if not message.attachments:
+        data.pop("attachments", None)
+    return data
 
 
 def _safe_display_name(filename: str | None) -> str:
@@ -698,6 +797,7 @@ async def _save_history(
     key: str,
     history: list[AIChatMessage],
     user_message: str,
+    user_attachments: list[AIChatAttachmentPublic],
     assistant_message: str,
 ) -> None:
     """完整流式响应结束后再写入 Redis，避免保存半截 assistant 回复。"""
@@ -707,13 +807,17 @@ async def _save_history(
     next_history = _trim_history(
         [
             *history,
-            AIChatMessage(role="user", content=user_message),
+            AIChatMessage(
+                role="user",
+                content=user_message,
+                attachments=user_attachments,
+            ),
             AIChatMessage(role="assistant", content=assistant_message),
         ]
     )
     await redis.set(
         key,
-        [message.model_dump() for message in next_history],
+        [_history_message_dump(message) for message in next_history],
         _session_ttl(),
     )
 
@@ -766,7 +870,11 @@ def _conversation_message_to_history(
     if message.role not in _PERSISTENT_MESSAGE_ROLES:
         return None
     role = cast(Literal["user", "assistant"], message.role)
-    return AIChatMessage(role=role, content=message.content)
+    return AIChatMessage(
+        role=role,
+        content=message.content,
+        attachments=_coerce_attachment_metadata(getattr(message, "attachments", [])),
+    )
 
 
 def _conversation_message_to_public(
@@ -775,11 +883,14 @@ def _conversation_message_to_public(
     if message.role not in _PERSISTENT_MESSAGE_ROLES:
         return None
     role = cast(Literal["user", "assistant"], message.role)
+    reasoning_fields = _reasoning_payload_fields(message.reasoning_content)
     return AIChatConversationMessagePublic(
         id=message.id,
         role=role,
         content=message.content,
-        reasoning_content=message.reasoning_content,
+        attachments=_coerce_attachment_metadata(getattr(message, "attachments", [])),
+        reasoning_title=reasoning_fields["reasoning_title"],
+        reasoning_content=reasoning_fields["reasoning_content"],
         created_at=message.created_at,
     )
 
@@ -1087,6 +1198,7 @@ async def stream_ai_chat_service(
         session is not None and conversation_id is not None and not history
     )
     payload = _openai_payload(history, request)
+    user_attachments = _attachment_public_metadata(request.attachments)
     should_emit_reasoning = request.should_emit_reasoning
     assistant_chunks: list[str] = []
     reasoning_chunks: list[str] = []
@@ -1099,7 +1211,14 @@ async def stream_ai_chat_service(
             if event == "reasoning":
                 reasoning_chunks.append(delta)
                 if should_emit_reasoning:
-                    yield _sse_event("reasoning", {"content": delta})
+                    reasoning_raw_content = "".join(reasoning_chunks)
+                    yield _sse_event(
+                        "reasoning",
+                        {
+                            "content": delta,
+                            **_reasoning_payload_fields(reasoning_raw_content),
+                        },
+                    )
                 continue
 
             if should_emit_reasoning:
@@ -1149,6 +1268,9 @@ async def stream_ai_chat_service(
             title=title,
             user_message=request.message,
             assistant_message=assistant_message,
+            user_attachments=[
+                attachment.model_dump() for attachment in user_attachments
+            ],
             reasoning_content=reasoning_message,
         )
     await _save_history(
@@ -1156,11 +1278,16 @@ async def stream_ai_chat_service(
         key=redis_key,
         history=history,
         user_message=request.message,
+        user_attachments=user_attachments,
         assistant_message=assistant_message,
     )
-    done_data = {"session_id": session_id, "message": assistant_message}
+    done_data: dict[str, Any] = {
+        "session_id": session_id,
+        "message": assistant_message,
+    }
     if reasoning_message is not None:
         done_data["reasoning"] = reasoning_message
+        done_data.update(_reasoning_payload_fields(reasoning_message))
     yield _sse_event("done", done_data)
 
 

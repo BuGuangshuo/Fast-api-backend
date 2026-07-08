@@ -79,7 +79,7 @@ celery -A app.core.celery_app:celery_app flower --port=5555
 
 ## AI 对话服务
 
-前端通过后端接口 `POST /api/v1/ai/chat/stream` 进行 SSE 流式对话；后端代理 OpenAI-compatible 服务，默认地址为 `http://127.0.0.1:1104/v1`，默认模型为 `Qwen3.5-9B-4bit`，启动时直接读取配置中的 `LLM_API_KEY` 和 `LLM_CHAT_MODEL`。
+前端通过后端接口 `POST /api/v1/ai/chat/stream` 进行 SSE 流式对话；后端代理 OpenAI-compatible 服务，默认地址为 `http://127.0.0.1:1104/v1`，默认模型为 `Qwen3.5-9B-MLX-4bit`，启动时直接读取配置中的 `LLM_API_KEY` 和 `LLM_CHAT_MODEL`。
 
 ## Codex 约束
 

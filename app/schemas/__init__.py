@@ -2,6 +2,7 @@
 
 from app.schemas.ai_chat import (
     AIChatAttachment,
+    AIChatAttachmentPublic,
     AIChatConversationListItem,
     AIChatConversationMessagePublic,
     AIChatConversationResponse,
@@ -32,6 +33,7 @@ from app.schemas.user import UserCreate, UserPublic
 __all__ = [
     "AIChatMessage",
     "AIChatAttachment",
+    "AIChatAttachmentPublic",
     "AIChatConversationListItem",
     "AIChatConversationMessagePublic",
     "AIChatConversationResponse",

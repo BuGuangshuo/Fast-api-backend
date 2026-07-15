@@ -21,6 +21,7 @@ from app.services.ai_chat_service import (
     get_ai_chat_conversation_service,
     get_ai_chat_session_service,
     list_ai_chat_conversations_service,
+    search_ai_chat_history_service,
     stream_ai_chat_service,
     update_ai_chat_conversation_title_service,
 )
@@ -346,6 +347,112 @@ def test_generated_ai_chat_title_rejects_generic_thinking_title() -> None:
     )
 
     assert title == "如何设计历史会话？"
+
+
+def test_search_ai_chat_history_returns_all_types_and_supports_filtering() -> None:
+    session = _db_session()
+    user = _user()
+    other_user = User(username="other-user", hashed_password="hashed")
+
+    ai_chat_service.crud.append_ai_chat_exchange(
+        session,
+        conversation_id=uuid.uuid4(),
+        user_id=user.id,
+        title="风险报告分析",
+        user_message="请分析风险报告中的异常数据",
+        assistant_message="正在分析",
+        user_attachments=[
+            {
+                "filename": "docs/风险报告.pdf",
+                "content_type": "application/pdf",
+                "size": 1024,
+            }
+        ],
+    )
+    ai_chat_service.crud.append_ai_chat_exchange(
+        session=session,
+        conversation_id=uuid.uuid4(),
+        user_id=other_user.id,
+        title="其他用户风险报告",
+        user_message="风险报告",
+        assistant_message="不可见",
+        user_attachments=[{"filename": "风险报告.docx", "size": 128}],
+    )
+
+    all_results = search_ai_chat_history_service(
+        session=session,
+        current_user=user,
+        keyword=" 风险报告 ",
+        result_type=None,
+        page=1,
+        page_size=8,
+    )
+    conversation_results = search_ai_chat_history_service(
+        session=session,
+        current_user=user,
+        keyword="风险报告",
+        result_type="conversation",
+        page=1,
+        page_size=8,
+    )
+    document_results = search_ai_chat_history_service(
+        session=session,
+        current_user=user,
+        keyword="风险报告",
+        result_type="document",
+        page=1,
+        page_size=8,
+    )
+
+    assert all_results.total == 2
+    assert {item.type for item in all_results.items} == {"conversation", "document"}
+    assert all(item.time is not None for item in all_results.items)
+    assert conversation_results.total == 1
+    assert conversation_results.items[0].type == "conversation"
+    assert "风险报告" in conversation_results.items[0].content
+    assert document_results.total == 1
+    assert document_results.items[0].type == "document"
+    assert document_results.items[0].content == "docs/风险报告.pdf"
+
+
+def test_search_ai_chat_history_paginates_combined_results() -> None:
+    session = _db_session()
+    user = _user()
+    ai_chat_service.crud.append_ai_chat_exchange(
+        session,
+        conversation_id=uuid.uuid4(),
+        user_id=user.id,
+        title="接口检索",
+        user_message="接口检索正文",
+        assistant_message="完成",
+        user_attachments=[{"filename": "接口检索说明.md", "size": 64}],
+    )
+
+    first_page = search_ai_chat_history_service(
+        session=session,
+        current_user=user,
+        keyword="接口检索",
+        result_type=None,
+        page=1,
+        page_size=1,
+    )
+    second_page = search_ai_chat_history_service(
+        session=session,
+        current_user=user,
+        keyword="接口检索",
+        result_type=None,
+        page=2,
+        page_size=1,
+    )
+
+    assert first_page.total == 2
+    assert second_page.total == 2
+    assert len(first_page.items) == 1
+    assert len(second_page.items) == 1
+    assert {first_page.items[0].type, second_page.items[0].type} == {
+        "conversation",
+        "document",
+    }
 
 
 def test_update_and_delete_ai_chat_conversation() -> None:

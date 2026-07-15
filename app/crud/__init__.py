@@ -6,6 +6,7 @@ from app.crud.ai_chat import (
     get_ai_chat_conversation_for_user,
     list_ai_chat_conversations,
     list_ai_chat_messages,
+    search_ai_chat_history,
     update_ai_chat_conversation_title,
 )
 from app.crud.user import (
@@ -26,6 +27,7 @@ __all__ = [
     "get_user_by_username",
     "list_ai_chat_conversations",
     "list_ai_chat_messages",
+    "search_ai_chat_history",
     "update_ai_chat_conversation_title",
     "update_user_last_login",
 ]

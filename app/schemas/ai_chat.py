@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 # ==================== API Request/Response Schemas ====================
 
 AIChatThinkingMode = Literal["auto", "thinking", "fast"]
+AIChatSearchType = Literal["conversation", "document"]
 
 
 class AIChatAttachmentPublic(BaseModel):
@@ -112,6 +113,16 @@ class AIChatConversationListItem(BaseModel):
     created_at: datetime = Field(description="创建时间")
     updated_at: datetime = Field(description="更新时间")
     last_message_at: datetime = Field(description="最近消息时间")
+
+
+class AIChatSearchResultItem(BaseModel):
+    """AI 对话历史搜索命中项。"""
+
+    conversation_id: uuid.UUID = Field(description="命中项所属会话 ID")
+    title: str = Field(description="命中项所属会话标题")
+    type: AIChatSearchType = Field(description="结果类型：conversation 或 document")
+    content: str = Field(description="命中的对话文字、会话标题或文档名")
+    time: datetime = Field(description="消息产生、文档上传或会话最近活动时间")
 
 
 class AIChatConversationMessagePublic(BaseModel):

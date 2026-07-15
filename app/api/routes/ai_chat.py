@@ -14,6 +14,8 @@ from app.schemas import (
     AIChatConversationListItem,
     AIChatConversationResponse,
     AIChatConversationUpdateRequest,
+    AIChatSearchResultItem,
+    AIChatSearchType,
     AIChatSessionResponse,
     AIChatStreamRequest,
     Message,
@@ -26,6 +28,7 @@ from app.services.ai_chat_service import (
     get_ai_chat_conversation_service,
     get_ai_chat_session_service,
     list_ai_chat_conversations_service,
+    search_ai_chat_history_service,
     stream_ai_chat_service,
     update_ai_chat_conversation_title_service,
 )
@@ -88,17 +91,56 @@ def list_ai_chat_conversations(
     current_user: CurrentUser,
     page: int = Query(default=1, ge=1, description="页码，从 1 开始"),
     page_size: int = Query(
-        default=20,
+        default=8,
         ge=1,
         le=100,
         alias="pageSize",
         description="每页数量",
     ),
 ) -> PaginatedResponse[AIChatConversationListItem]:
-    """读取当前用户 AI 对话最近栏列表。"""
+    """分页读取当前用户 AI 对话历史。"""
     return list_ai_chat_conversations_service(
         session=session,
         current_user=current_user,
+        page=page,
+        page_size=page_size,
+    )
+
+
+@router.get(
+    "/chat/conversations/search",
+    response_model=PaginatedResponse[AIChatSearchResultItem],
+)
+def search_ai_chat_history(
+    *,
+    session: SessionDep,
+    current_user: CurrentUser,
+    keyword: str = Query(
+        min_length=1,
+        max_length=128,
+        pattern=r".*\S.*",
+        description="对话文字、会话标题或历史文档名关键词",
+    ),
+    result_type: AIChatSearchType | None = Query(
+        default=None,
+        alias="type",
+        description="结果类型；不传则返回 conversation 和 document",
+    ),
+    page: int = Query(default=1, ge=1, description="页码，从 1 开始"),
+    page_size: int = Query(
+        default=8,
+        ge=1,
+        le=100,
+        alias="pageSize",
+        description="每页数量",
+    ),
+) -> PaginatedResponse[AIChatSearchResultItem]:
+    """模糊搜索当前用户的历史对话文字和已上传文档名。"""
+    return search_ai_chat_history_service(
+        session=session,
+        current_user=current_user,
+        keyword=keyword,
+        result_type=result_type,
         page=page,
         page_size=page_size,
     )

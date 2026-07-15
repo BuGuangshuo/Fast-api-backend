@@ -32,6 +32,8 @@ from app.schemas import (
     AIChatConversationMessagePublic,
     AIChatConversationResponse,
     AIChatMessage,
+    AIChatSearchResultItem,
+    AIChatSearchType,
     AIChatSessionResponse,
     AIChatStreamRequest,
     Message,
@@ -1298,7 +1300,7 @@ def list_ai_chat_conversations_service(
     page: int,
     page_size: int,
 ) -> PaginatedResponse[AIChatConversationListItem]:
-    """读取当前用户的 AI 对话最近栏列表。"""
+    """分页读取当前用户的 AI 对话历史。"""
     conversations, total = crud.list_ai_chat_conversations(
         session,
         user_id=current_user.id,
@@ -1318,6 +1320,41 @@ def list_ai_chat_conversations_service(
                 last_message_at=conversation.last_message_at,
             )
             for conversation in conversations
+        ],
+    )
+
+
+def search_ai_chat_history_service(
+    *,
+    session: Session,
+    current_user: User,
+    keyword: str,
+    result_type: AIChatSearchType | None,
+    page: int,
+    page_size: int,
+) -> PaginatedResponse[AIChatSearchResultItem]:
+    """搜索当前用户的对话文字、标题及历史附件文件名。"""
+    matches, total = crud.search_ai_chat_history(
+        session,
+        user_id=current_user.id,
+        keyword=keyword.strip(),
+        result_type=result_type,
+        page=page,
+        page_size=page_size,
+    )
+    return PaginatedResponse[AIChatSearchResultItem](
+        total=total,
+        page=page,
+        page_size=page_size,
+        items=[
+            AIChatSearchResultItem(
+                conversation_id=match.conversation_id,
+                title=match.title,
+                type=match.result_type,
+                content=match.content,
+                time=match.time,
+            )
+            for match in matches
         ],
     )
 

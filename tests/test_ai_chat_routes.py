@@ -1,3 +1,4 @@
+import uuid
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -119,3 +120,95 @@ def test_ai_chat_stream_route_accepts_multipart_files(monkeypatch: Any) -> None:
     assert captured_requests[0].message == "分析附件"
     assert captured_requests[0].attachments[0].filename == "folder/a.txt"
     assert captured_requests[0].attachments[0].text == "hello"
+
+
+def test_ai_chat_conversation_list_uses_default_page_size(
+    monkeypatch: Any,
+) -> None:
+    captured_params: dict[str, Any] = {}
+
+    async def fake_current_user() -> User:
+        return _user()
+
+    def fake_db() -> Session:
+        return _session()
+
+    def fake_list_service(**kwargs: Any) -> dict[str, Any]:
+        captured_params.update(kwargs)
+        return {
+            "total": 0,
+            "page": kwargs["page"],
+            "page_size": kwargs["page_size"],
+            "items": [],
+        }
+
+    monkeypatch.setattr(
+        "app.api.routes.ai_chat.list_ai_chat_conversations_service",
+        fake_list_service,
+    )
+    app.dependency_overrides[get_current_user] = fake_current_user
+    app.dependency_overrides[get_db] = fake_db
+    try:
+        client = TestClient(app)
+        response = client.get(
+            "/api/v1/ai/chat/conversations",
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json()["page_size"] == 8
+    assert captured_params["page"] == 1
+    assert captured_params["page_size"] == 8
+
+
+def test_ai_chat_history_search_forwards_type_and_default_pagination(
+    monkeypatch: Any,
+) -> None:
+    captured_params: dict[str, Any] = {}
+
+    async def fake_current_user() -> User:
+        return _user()
+
+    def fake_db() -> Session:
+        return _session()
+
+    def fake_search_service(**kwargs: Any) -> dict[str, Any]:
+        captured_params.update(kwargs)
+        return {
+            "total": 1,
+            "page": kwargs["page"],
+            "page_size": kwargs["page_size"],
+            "items": [
+                {
+                    "conversation_id": str(uuid.uuid4()),
+                    "title": "文档会话",
+                    "type": "document",
+                    "content": "风险报告.pdf",
+                    "time": "2026-07-15T10:00:00Z",
+                }
+            ],
+        }
+
+    monkeypatch.setattr(
+        "app.api.routes.ai_chat.search_ai_chat_history_service",
+        fake_search_service,
+    )
+    app.dependency_overrides[get_current_user] = fake_current_user
+    app.dependency_overrides[get_db] = fake_db
+    try:
+        client = TestClient(app)
+        response = client.get(
+            "/api/v1/ai/chat/conversations/search",
+            params={"keyword": "风险", "type": "document"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json()["items"][0]["type"] == "document"
+    assert response.json()["items"][0]["time"] == "2026-07-15T10:00:00Z"
+    assert captured_params["keyword"] == "风险"
+    assert captured_params["result_type"] == "document"
+    assert captured_params["page"] == 1
+    assert captured_params["page_size"] == 8

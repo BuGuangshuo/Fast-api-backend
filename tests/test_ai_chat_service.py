@@ -16,15 +16,21 @@ from app.schemas import AIChatStreamRequest
 from app.services import ai_chat_service
 from app.services.ai_chat_service import (
     build_ai_chat_stream_request_from_multipart,
+    cancel_ai_chat_generation_service,
     delete_ai_chat_conversation_service,
     delete_ai_chat_session_service,
+    get_ai_chat_conversation_generation_service,
     get_ai_chat_conversation_service,
+    get_ai_chat_generation_service,
     get_ai_chat_session_service,
     list_ai_chat_conversations_service,
     search_ai_chat_history_service,
+    start_resumable_ai_chat_service,
+    stream_ai_chat_generation_service,
     stream_ai_chat_service,
     update_ai_chat_conversation_title_service,
 )
+from app.tasks.ai_chat import _stream_until_generation_cancelled
 
 
 class FakeRedis:
@@ -338,6 +344,78 @@ def test_stream_ai_chat_persists_conversation_and_can_continue(
     )
     assert conversations.total == 1
     assert conversations.items[0].title == "历史会话设计"
+
+
+def test_stream_ai_chat_saves_partial_reply_when_client_stops(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    delta_received = asyncio.Event()
+
+    async def fake_iter_openai_deltas(
+        payload: dict[str, Any],
+    ) -> AsyncIterator[tuple[str, str]]:
+        _ = payload
+        yield "delta", "终止前内容"
+        await asyncio.Event().wait()
+
+    async def fake_generate_title(*, user_message: str) -> str:
+        _ = user_message
+        return "手动终止测试"
+
+    monkeypatch.setattr(
+        ai_chat_service,
+        "_iter_openai_deltas",
+        fake_iter_openai_deltas,
+    )
+    monkeypatch.setattr(
+        ai_chat_service,
+        "_generate_conversation_title",
+        fake_generate_title,
+    )
+    session = _db_session()
+    redis = FakeRedis()
+    user = _user()
+
+    async def stop_after_first_delta() -> str:
+        events: list[str] = []
+        stream = stream_ai_chat_service(
+            redis=redis,
+            current_user=user,
+            request=AIChatStreamRequest(message="请生成一段内容"),
+            session=session,
+        )
+
+        async def consume_stream() -> None:
+            async for event in stream:
+                events.append(event)
+                if event.startswith("event: delta"):
+                    delta_received.set()
+
+        consumer = asyncio.create_task(consume_stream())
+        await delta_received.wait()
+        consumer.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await consumer
+
+        assert '"content": "终止前内容"' in events[-1]
+        return events[0].split('"session_id": "')[1].split('"')[0]
+
+    session_id = asyncio.run(stop_after_first_delta())
+    detail = get_ai_chat_conversation_service(
+        session=session,
+        current_user=user,
+        conversation_id=uuid.UUID(session_id),
+    )
+
+    assert [message.content for message in detail.messages] == [
+        "请生成一段内容",
+        "终止前内容",
+    ]
+    redis_history = next(iter(redis.store.values()))
+    assert redis_history[-1] == {
+        "role": "assistant",
+        "content": "终止前内容",
+    }
 
 
 def test_generated_ai_chat_title_rejects_generic_thinking_title() -> None:
@@ -1176,11 +1254,14 @@ def test_stream_ai_chat_splits_reasoning_title_and_content(
         )
     )
     session_id = events[0].split('"session_id": "')[1].split('"')[0]
+    reasoning_events = [
+        event for event in events if event.startswith("event: reasoning")
+    ]
 
-    assert '"reasoning_title": "思考摘要"' in events[1]
-    assert '"reasoning_content": ""' in events[1]
-    assert '"reasoning_title": "思考摘要"' in events[2]
-    assert '"reasoning_content": "先判断问题，再组织回答"' in events[2]
+    assert '"reasoning_title": "思考摘要"' in reasoning_events[0]
+    assert '"reasoning_content": ""' in reasoning_events[0]
+    assert '"reasoning_title": "思考摘要"' in reasoning_events[1]
+    assert '"reasoning_content": "先判断问题，再组织回答"' in reasoning_events[1]
     assert '"reasoning": "# 思考摘要\\n先判断问题，再组织回答"' in events[-1]
     assert '"reasoning_title": "思考摘要"' in events[-1]
     assert '"reasoning_content": "先判断问题，再组织回答"' in events[-1]
@@ -1277,6 +1358,101 @@ def test_stream_ai_chat_strips_duplicated_reasoning_from_answer(
 
     assert 'event: delta\ndata: {"content": "最终答案"}' in events[2]
     assert '"message": "最终答案"' in events[-1]
+
+
+def test_stream_ai_chat_falls_back_when_thinking_only_returns_duplicated_content(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured_payloads: list[dict[str, Any]] = []
+
+    class FakeAsyncClient:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        async def __aenter__(self) -> "FakeAsyncClient":
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            return None
+
+        def stream(
+            self,
+            method: str,
+            url: str,
+            json: dict[str, Any],
+            headers: dict[str, str],
+        ) -> FakeStreamResponse:
+            _ = (method, url, headers)
+            captured_payloads.append(json)
+            if len(captured_payloads) == 1:
+                return FakeStreamResponse(
+                    [
+                        'data: {"choices":[{"delta":{"reasoning_content":"先分析","content":"先分析"}}]}',
+                        'data: {"choices":[{"delta":{},"finish_reason":"length"}]}',
+                        "data: [DONE]",
+                    ]
+                )
+            return FakeStreamResponse(
+                [
+                    'data: {"choices":[{"delta":{"content":"正式回答"}}]}',
+                    'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}',
+                    "data: [DONE]",
+                ]
+            )
+
+        async def post(
+            self,
+            url: str,
+            json: dict[str, Any],
+            headers: dict[str, str],
+        ) -> FakeJSONResponse:
+            _ = (url, json, headers)
+            return FakeJSONResponse({"choices": [{"message": {"content": "附件分析"}}]})
+
+    monkeypatch.setattr(ai_chat_service.httpx, "AsyncClient", FakeAsyncClient)
+    session = _db_session()
+    user = _user()
+
+    events = asyncio.run(
+        _collect_stream(
+            FakeRedis(),
+            user,
+            AIChatStreamRequest(
+                message="分析附件",
+                thinking_mode="thinking",
+                attachments=[
+                    {
+                        "filename": "report.txt",
+                        "content_type": "text/plain",
+                        "size": 4,
+                        "text": "内容",
+                    }
+                ],
+            ),
+            session=session,
+        )
+    )
+    session_id = events[0].split('"session_id": "')[1].split('"')[0]
+
+    assert len(captured_payloads) == 2
+    assert captured_payloads[0]["chat_template_kwargs"] == {"enable_thinking": True}
+    assert captured_payloads[1]["chat_template_kwargs"] == {"enable_thinking": False}
+    assert 'event: title\ndata: {"session_id":' in events[1]
+    assert '"title": "附件分析"' in events[1]
+    assert any(
+        event == 'event: delta\ndata: {"content": "正式回答"}\n\n' for event in events
+    )
+    assert '"message": "正式回答"' in events[-1]
+    assert '"reasoning": "先分析"' in events[-1]
+
+    detail = get_ai_chat_conversation_service(
+        session=session,
+        current_user=user,
+        conversation_id=uuid.UUID(session_id),
+    )
+    assert detail.title == "附件分析"
+    assert detail.messages[1].content == "正式回答"
+    assert detail.messages[1].reasoning_content == "先分析"
 
 
 def test_stream_ai_chat_returns_error_event_on_upstream_status(
@@ -1413,3 +1589,316 @@ def test_get_and_delete_ai_chat_session() -> None:
     )
     assert message.message == AIChatMsg.SESSION_DELETED
     assert redis.store == {}
+
+
+def test_start_resumable_ai_chat_creates_visible_conversation_and_job(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    queued_args: list[tuple[str, str]] = []
+
+    def fake_delay(generation_id: str, user_id: str) -> None:
+        queued_args.append((generation_id, user_id))
+
+    monkeypatch.setattr(
+        "app.tasks.ai_chat.generate_ai_chat_response_task.delay",
+        fake_delay,
+    )
+    session = _db_session()
+    redis = FakeRedis()
+    user = _user()
+
+    async def start_and_stop() -> tuple[str, str]:
+        stream = start_resumable_ai_chat_service(
+            session=session,
+            redis=redis,
+            current_user=user,
+            request=AIChatStreamRequest(message="刷新后继续", resumable=True),
+        )
+        generation_event = await anext(stream)
+        status_event = await anext(stream)
+        await stream.aclose()
+        return generation_event, status_event
+
+    generation_event, status_event = asyncio.run(start_and_stop())
+    generation_id = generation_event.split('"generation_id": "')[1].split('"')[0]
+    session_id = generation_event.split('"session_id": "')[1].split('"')[0]
+
+    assert generation_event.startswith("event: generation")
+    assert '"status": "queued"' in status_event
+    assert queued_args == [(generation_id, str(user.id))]
+    assert RedisKey.ai_chat_generation(str(user.id), generation_id) in redis.store
+    assert (
+        RedisKey.ai_chat_generation_request(str(user.id), generation_id) in redis.store
+    )
+    assert (
+        redis.store[RedisKey.ai_chat_conversation_generation(str(user.id), session_id)]
+        == generation_id
+    )
+
+    conversations = list_ai_chat_conversations_service(
+        session=session,
+        current_user=user,
+        page=1,
+        page_size=8,
+    )
+    assert conversations.total == 1
+    assert str(conversations.items[0].id) == session_id
+    detail = get_ai_chat_conversation_service(
+        session=session,
+        current_user=user,
+        conversation_id=uuid.UUID(session_id),
+    )
+    assert [(message.role, message.content) for message in detail.messages] == [
+        ("user", "刷新后继续")
+    ]
+    snapshot = asyncio.run(
+        get_ai_chat_conversation_generation_service(
+            session=session,
+            redis=redis,
+            current_user=user,
+            conversation_id=uuid.UUID(session_id),
+        )
+    )
+    assert snapshot.generation_id == generation_id
+    assert snapshot.prompt == "刷新后继续"
+    assert snapshot.status == "queued"
+
+
+def test_resumable_worker_does_not_duplicate_persisted_user_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured_payloads: list[dict[str, Any]] = []
+
+    async def fake_iter_openai_deltas(
+        payload: dict[str, Any],
+    ) -> AsyncIterator[tuple[str, str]]:
+        captured_payloads.append(payload)
+        yield "delta", "后台回答"
+
+    async def fake_generate_title(*, user_message: str) -> str:
+        _ = user_message
+        return "后台恢复测试"
+
+    monkeypatch.setattr(
+        ai_chat_service,
+        "_iter_openai_deltas",
+        fake_iter_openai_deltas,
+    )
+    monkeypatch.setattr(
+        ai_chat_service,
+        "_generate_conversation_title",
+        fake_generate_title,
+    )
+    session = _db_session()
+    redis = FakeRedis()
+    user = _user()
+    conversation = ai_chat_service.crud.create_ai_chat_conversation(
+        session,
+        conversation_id=uuid.uuid4(),
+        user_id=user.id,
+        title="新聊天",
+    )
+    ai_chat_service.crud.append_ai_chat_user_message(
+        session,
+        conversation=conversation,
+        content="已经落库的问题",
+    )
+
+    events = asyncio.run(
+        _collect_stream_with_persisted_user(
+            redis=redis,
+            user=user,
+            request=AIChatStreamRequest(
+                session_id=str(conversation.id),
+                message="已经落库的问题",
+            ),
+            session=session,
+        )
+    )
+    detail = get_ai_chat_conversation_service(
+        session=session,
+        current_user=user,
+        conversation_id=conversation.id,
+    )
+
+    assert captured_payloads[0]["messages"] == [
+        {"role": "user", "content": "已经落库的问题"}
+    ]
+    assert events[-1].startswith("event: done")
+    assert [(message.role, message.content) for message in detail.messages] == [
+        ("user", "已经落库的问题"),
+        ("assistant", "后台回答"),
+    ]
+
+
+async def _collect_stream_with_persisted_user(
+    *,
+    redis: FakeRedis,
+    user: User,
+    request: AIChatStreamRequest,
+    session: Session,
+) -> list[str]:
+    return [
+        event
+        async for event in stream_ai_chat_service(
+            redis=redis,
+            current_user=user,
+            request=request,
+            session=session,
+            user_message_persisted=True,
+        )
+    ]
+
+
+def test_generation_snapshot_can_resume_from_offsets() -> None:
+    redis = FakeRedis()
+    user = _user()
+    generation_id = "generation-test"
+    key = RedisKey.ai_chat_generation(str(user.id), generation_id)
+    redis.store[key] = {
+        "generation_id": generation_id,
+        "session_id": str(uuid.uuid4()),
+        "prompt": "请继续生成",
+        "status": "completed",
+        "title": "恢复回答",
+        "reasoning_content": "思考过程",
+        "content": "最终回答",
+        "error": None,
+        "revision": 4,
+    }
+    redis.ttls[key] = 120
+
+    snapshot = asyncio.run(
+        get_ai_chat_generation_service(
+            redis=redis,
+            current_user=user,
+            generation_id=generation_id,
+        )
+    )
+    assert snapshot.status == "completed"
+    assert snapshot.prompt == "请继续生成"
+    assert snapshot.reasoning_content == "思考过程"
+    assert snapshot.content == "最终回答"
+    assert snapshot.ttl == 120
+
+    events = asyncio.run(
+        _collect_generation_stream(
+            redis=redis,
+            user=user,
+            generation_id=generation_id,
+            reasoning_offset=2,
+            content_offset=2,
+        )
+    )
+    assert any('"content": "过程"' in event for event in events)
+    assert any('"content": "回答"' in event for event in events)
+    assert events[-1].startswith("event: done")
+
+
+def test_cancel_generation_is_idempotent_and_stops_future_streams() -> None:
+    redis = FakeRedis()
+    user = _user()
+    generation_id = "generation-cancel"
+    key = RedisKey.ai_chat_generation(str(user.id), generation_id)
+    redis.store[key] = {
+        "generation_id": generation_id,
+        "session_id": str(uuid.uuid4()),
+        "prompt": "请停止生成",
+        "status": "answering",
+        "title": "停止测试",
+        "reasoning_content": "部分思考",
+        "content": "部分回答",
+        "error": None,
+        "revision": 3,
+    }
+    redis.ttls[key] = 120
+
+    first_snapshot = asyncio.run(
+        cancel_ai_chat_generation_service(
+            redis=redis,
+            current_user=user,
+            generation_id=generation_id,
+        )
+    )
+    second_snapshot = asyncio.run(
+        cancel_ai_chat_generation_service(
+            redis=redis,
+            current_user=user,
+            generation_id=generation_id,
+        )
+    )
+
+    assert first_snapshot.status == "cancelled"
+    assert first_snapshot.prompt == "请停止生成"
+    assert first_snapshot.content == "部分回答"
+    assert first_snapshot.reasoning_content == "部分思考"
+    assert first_snapshot.revision == 4
+    assert second_snapshot.status == "cancelled"
+    assert second_snapshot.revision == 4
+    assert (
+        redis.store[RedisKey.ai_chat_generation_cancelled(str(user.id), generation_id)]
+        is True
+    )
+
+    events = asyncio.run(
+        _collect_generation_stream(
+            redis=redis,
+            user=user,
+            generation_id=generation_id,
+            reasoning_offset=len(first_snapshot.reasoning_content),
+            content_offset=len(first_snapshot.content),
+        )
+    )
+    assert len(events) == 2
+    assert events[0].startswith("event: status")
+    assert '"status": "cancelled"' in events[0]
+    assert events[1].startswith("event: title")
+
+
+def test_worker_closes_upstream_stream_after_generation_is_cancelled() -> None:
+    redis = FakeRedis()
+    cancelled_key = "generation-cancelled-test"
+    upstream_closed = False
+
+    async def blocking_stream() -> AsyncIterator[str]:
+        nonlocal upstream_closed
+        try:
+            yield "event: delta\ndata: {}\n\n"
+            await asyncio.Event().wait()
+        finally:
+            upstream_closed = True
+
+    async def consume_until_cancelled() -> None:
+        stream = _stream_until_generation_cancelled(
+            stream=blocking_stream(),
+            redis=redis,
+            cancelled_key=cancelled_key,
+        )
+        assert await anext(stream) == "event: delta\ndata: {}\n\n"
+        await redis.set(cancelled_key, True, 120)
+        with pytest.raises(StopAsyncIteration):
+            await anext(stream)
+
+    asyncio.run(consume_until_cancelled())
+
+    assert upstream_closed is True
+
+
+async def _collect_generation_stream(
+    *,
+    redis: FakeRedis,
+    user: User,
+    generation_id: str,
+    reasoning_offset: int,
+    content_offset: int,
+) -> list[str]:
+    return [
+        event
+        async for event in stream_ai_chat_generation_service(
+            redis=redis,
+            current_user=user,
+            generation_id=generation_id,
+            reasoning_offset=reasoning_offset,
+            content_offset=content_offset,
+        )
+    ]

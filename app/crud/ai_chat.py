@@ -182,6 +182,87 @@ def _next_message_sort_order(
     return int(max_order or 0) + 1
 
 
+def create_ai_chat_conversation(
+    session: Session,
+    *,
+    conversation_id: uuid.UUID,
+    user_id: uuid.UUID,
+    title: str,
+) -> AIChatConversation:
+    """先创建可恢复生成的会话占位，使生成期间也能出现在最近对话中。"""
+    now = utc_now()
+    conversation = AIChatConversation(
+        id=conversation_id,
+        user_id=user_id,
+        title=title,
+        created_at=now,
+        updated_at=now,
+        last_message_at=now,
+    )
+    session.add(conversation)
+    session.commit()
+    session.refresh(conversation)
+    return conversation
+
+
+def append_ai_chat_user_message(
+    session: Session,
+    *,
+    conversation: AIChatConversation,
+    content: str,
+    attachments: list[dict[str, Any]] | None = None,
+) -> AIChatConversationMessage:
+    """在后台生成入队前写入用户消息，确保刷新时问题已经可恢复。"""
+    now = utc_now()
+    message = AIChatConversationMessage(
+        conversation_id=conversation.id,
+        role="user",
+        content=content,
+        attachments=attachments or [],
+        sort_order=_next_message_sort_order(
+            session,
+            conversation_id=conversation.id,
+        ),
+        created_at=now,
+    )
+    conversation.updated_at = now
+    conversation.last_message_at = now
+    session.add(conversation)
+    session.add(message)
+    session.commit()
+    session.refresh(message)
+    return message
+
+
+def append_ai_chat_assistant_message(
+    session: Session,
+    *,
+    conversation: AIChatConversation,
+    content: str,
+    reasoning_content: str | None = None,
+) -> AIChatConversationMessage:
+    """在后台生成结束或停止后，追加对应的 assistant 消息。"""
+    now = utc_now()
+    message = AIChatConversationMessage(
+        conversation_id=conversation.id,
+        role="assistant",
+        content=content,
+        reasoning_content=reasoning_content,
+        sort_order=_next_message_sort_order(
+            session,
+            conversation_id=conversation.id,
+        ),
+        created_at=now,
+    )
+    conversation.updated_at = now
+    conversation.last_message_at = now
+    session.add(conversation)
+    session.add(message)
+    session.commit()
+    session.refresh(message)
+    return message
+
+
 def append_ai_chat_exchange(
     session: Session,
     *,

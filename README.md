@@ -74,12 +74,17 @@ celery -A app.core.celery_app:celery_app flower --port=5555
 - `GET /api/v1/test-redis/cache/get/{key}`
 - `DELETE /api/v1/test-redis/cache/delete/{key}`
 - `POST /api/v1/ai/chat/stream`
+- `GET /api/v1/ai/chat/generations/{generation_id}`
+- `GET /api/v1/ai/chat/generations/{generation_id}/stream`
+- `GET /api/v1/ai/chat/conversations/{conversation_id}/generation`
 - `GET /api/v1/ai/chat/sessions/{session_id}`
 - `DELETE /api/v1/ai/chat/sessions/{session_id}`
 
 ## AI 对话服务
 
 前端通过后端接口 `POST /api/v1/ai/chat/stream` 进行 SSE 流式对话；后端代理 OpenAI-compatible 服务，默认地址为 `http://127.0.0.1:1104/v1`，默认模型为 `Qwen3.5-9B-MLX-4bit`，启动时直接读取配置中的 `LLM_API_KEY` 和 `LLM_CHAT_MODEL`。
+
+需要浏览器刷新后继续显示生成过程时，请在请求中传 `resumable=true`。后端会返回 `generation` 事件并由 Celery 在后台继续生成；前端重新进入会话后，可先按 `conversation_id` 查询 generation 快照，再使用当前 `reasoning_content` / `content` 字符长度作为 `reasoningOffset` / `contentOffset` 重新订阅 SSE。
 
 ## Codex 约束
 

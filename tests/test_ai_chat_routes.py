@@ -122,6 +122,51 @@ def test_ai_chat_stream_route_accepts_multipart_files(monkeypatch: Any) -> None:
     assert captured_requests[0].attachments[0].text == "hello"
 
 
+def test_cancel_ai_chat_generation_route_returns_cancelled_snapshot(
+    monkeypatch: Any,
+) -> None:
+    generation_id = "generation-route-cancel"
+
+    async def fake_current_user() -> User:
+        return _user()
+
+    async def fake_redis() -> FakeRedis:
+        return FakeRedis()
+
+    async def fake_cancel_service(**kwargs: Any) -> dict[str, Any]:
+        assert kwargs["generation_id"] == generation_id
+        return {
+            "generation_id": generation_id,
+            "session_id": str(uuid.uuid4()),
+            "prompt": "请停止生成",
+            "status": "cancelled",
+            "title": "停止测试",
+            "reasoning_content": "部分思考",
+            "content": "部分回答",
+            "error": None,
+            "revision": 2,
+            "ttl": 120,
+        }
+
+    monkeypatch.setattr(
+        "app.api.routes.ai_chat.cancel_ai_chat_generation_service",
+        fake_cancel_service,
+    )
+    app.dependency_overrides[get_current_user] = fake_current_user
+    app.dependency_overrides[get_redis] = fake_redis
+    try:
+        client = TestClient(app)
+        response = client.post(
+            f"/api/v1/ai/chat/generations/{generation_id}/cancel",
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "cancelled"
+    assert response.json()["content"] == "部分回答"
+
+
 def test_ai_chat_conversation_list_uses_default_page_size(
     monkeypatch: Any,
 ) -> None:

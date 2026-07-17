@@ -14,6 +14,7 @@ from app.schemas import (
     AIChatConversationListItem,
     AIChatConversationResponse,
     AIChatConversationUpdateRequest,
+    AIChatGenerationResponse,
     AIChatSearchResultItem,
     AIChatSearchType,
     AIChatSessionResponse,
@@ -23,12 +24,17 @@ from app.schemas import (
 )
 from app.services.ai_chat_service import (
     build_ai_chat_stream_request_from_multipart,
+    cancel_ai_chat_generation_service,
     delete_ai_chat_conversation_service,
     delete_ai_chat_session_service,
+    get_ai_chat_conversation_generation_service,
     get_ai_chat_conversation_service,
+    get_ai_chat_generation_service,
     get_ai_chat_session_service,
     list_ai_chat_conversations_service,
     search_ai_chat_history_service,
+    start_resumable_ai_chat_service,
+    stream_ai_chat_generation_service,
     stream_ai_chat_service,
     update_ai_chat_conversation_title_service,
 )
@@ -66,12 +72,84 @@ async def stream_ai_chat(
 ) -> StreamingResponse:
     """发起受登录保护的流式 AI 对话，支持 JSON 或带附件表单。"""
     request = await _parse_stream_request(http_request)
-    return StreamingResponse(
-        stream_ai_chat_service(
+    stream = (
+        start_resumable_ai_chat_service(
             session=session,
             redis=redis,
             current_user=current_user,
             request=request,
+        )
+        if request.resumable
+        else stream_ai_chat_service(
+            session=session,
+            redis=redis,
+            current_user=current_user,
+            request=request,
+        )
+    )
+    return StreamingResponse(
+        stream,
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@router.get(
+    "/chat/generations/{generation_id}",
+    response_model=AIChatGenerationResponse,
+)
+async def get_ai_chat_generation(
+    *,
+    redis: RedisDep,
+    current_user: CurrentUser,
+    generation_id: str,
+) -> AIChatGenerationResponse:
+    """读取可恢复 AI 回答的当前状态和完整已生成内容。"""
+    return await get_ai_chat_generation_service(
+        redis=redis,
+        current_user=current_user,
+        generation_id=generation_id,
+    )
+
+
+@router.post(
+    "/chat/generations/{generation_id}/cancel",
+    response_model=AIChatGenerationResponse,
+)
+async def cancel_ai_chat_generation(
+    *,
+    redis: RedisDep,
+    current_user: CurrentUser,
+    generation_id: str,
+) -> AIChatGenerationResponse:
+    """停止后台 AI 回答，并返回保留部分内容后的终态快照。"""
+    return await cancel_ai_chat_generation_service(
+        redis=redis,
+        current_user=current_user,
+        generation_id=generation_id,
+    )
+
+
+@router.get("/chat/generations/{generation_id}/stream")
+async def stream_ai_chat_generation(
+    *,
+    redis: RedisDep,
+    current_user: CurrentUser,
+    generation_id: str,
+    reasoning_offset: int = Query(default=0, ge=0, alias="reasoningOffset"),
+    content_offset: int = Query(default=0, ge=0, alias="contentOffset"),
+) -> StreamingResponse:
+    """刷新或重新进入会话后，从指定字符位置继续订阅后台回答。"""
+    return StreamingResponse(
+        stream_ai_chat_generation_service(
+            redis=redis,
+            current_user=current_user,
+            generation_id=generation_id,
+            reasoning_offset=reasoning_offset,
+            content_offset=content_offset,
         ),
         media_type="text/event-stream",
         headers={
@@ -159,6 +237,26 @@ def get_ai_chat_conversation(
     """读取当前用户 AI 对话完整历史。"""
     return get_ai_chat_conversation_service(
         session=session,
+        current_user=current_user,
+        conversation_id=conversation_id,
+    )
+
+
+@router.get(
+    "/chat/conversations/{conversation_id}/generation",
+    response_model=AIChatGenerationResponse,
+)
+async def get_ai_chat_conversation_generation(
+    *,
+    session: SessionDep,
+    redis: RedisDep,
+    current_user: CurrentUser,
+    conversation_id: uuid.UUID,
+) -> AIChatGenerationResponse:
+    """从最近对话恢复当前或最近一次后台生成状态。"""
+    return await get_ai_chat_conversation_generation_service(
+        session=session,
+        redis=redis,
         current_user=current_user,
         conversation_id=conversation_id,
     )

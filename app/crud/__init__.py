@@ -1,7 +1,10 @@
 """CRUD exports."""
 
 from app.crud.ai_chat import (
+    append_ai_chat_assistant_message,
     append_ai_chat_exchange,
+    append_ai_chat_user_message,
+    create_ai_chat_conversation,
     delete_ai_chat_conversation,
     get_ai_chat_conversation_for_user,
     list_ai_chat_conversations,
@@ -18,7 +21,10 @@ from app.crud.user import (
 )
 
 __all__ = [
+    "append_ai_chat_assistant_message",
     "append_ai_chat_exchange",
+    "append_ai_chat_user_message",
+    "create_ai_chat_conversation",
     "create_user",
     "delete_ai_chat_conversation",
     "get_ai_chat_conversation_for_user",

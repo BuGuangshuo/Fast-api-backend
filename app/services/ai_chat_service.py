@@ -1,5 +1,6 @@
 """AI 对话 Service。"""
 
+import asyncio
 import base64
 import importlib
 import io
@@ -31,6 +32,8 @@ from app.schemas import (
     AIChatConversationListItem,
     AIChatConversationMessagePublic,
     AIChatConversationResponse,
+    AIChatGenerationResponse,
+    AIChatGenerationStatus,
     AIChatMessage,
     AIChatSearchResultItem,
     AIChatSearchType,
@@ -154,6 +157,7 @@ _REASONING_LABEL_RE = re.compile(
     flags=re.IGNORECASE,
 )
 _REASONING_BOLD_RE = re.compile(r"^\s*\*\*(?P<title>[^*]+?)\*\*\s*$")
+_GENERATION_POLL_INTERVAL_SECONDS = 0.2
 
 
 class _AIChatUpstreamError(Exception):
@@ -180,6 +184,18 @@ def _session_key(user: User, session_id: str) -> str:
     return RedisKey.ai_chat_session(str(user.id), session_id)
 
 
+def _generation_key(user_id: uuid.UUID | str, generation_id: str) -> str:
+    return RedisKey.ai_chat_generation(str(user_id), generation_id)
+
+
+def _generation_request_key(user_id: uuid.UUID | str, generation_id: str) -> str:
+    return RedisKey.ai_chat_generation_request(str(user_id), generation_id)
+
+
+def _generation_cancelled_key(user_id: uuid.UUID | str, generation_id: str) -> str:
+    return RedisKey.ai_chat_generation_cancelled(str(user_id), generation_id)
+
+
 def _parse_conversation_id(session_id: str | None) -> uuid.UUID | None:
     if session_id is None:
         return None
@@ -187,6 +203,335 @@ def _parse_conversation_id(session_id: str | None) -> uuid.UUID | None:
         return uuid.UUID(session_id)
     except ValueError:
         return None
+
+
+def _coerce_generation_status(value: Any) -> AIChatGenerationStatus:
+    if value in {
+        "queued",
+        "thinking",
+        "answering",
+        "completed",
+        "cancelled",
+        "failed",
+    }:
+        return cast(AIChatGenerationStatus, value)
+    return "failed"
+
+
+def _generation_response(
+    *,
+    generation_id: str,
+    value: dict[str, Any],
+    ttl: int,
+) -> AIChatGenerationResponse:
+    """将 Redis 生成快照转换为稳定的 API 响应。"""
+    return AIChatGenerationResponse(
+        generation_id=generation_id,
+        session_id=str(value.get("session_id", "")),
+        prompt=str(value.get("prompt", "")),
+        status=_coerce_generation_status(value.get("status")),
+        title=value.get("title") if isinstance(value.get("title"), str) else None,
+        reasoning_content=str(value.get("reasoning_content", "")),
+        content=str(value.get("content", "")),
+        error=value.get("error") if isinstance(value.get("error"), str) else None,
+        revision=max(int(value.get("revision", 0)), 0),
+        ttl=ttl,
+    )
+
+
+async def _load_generation_value(
+    *,
+    redis: RedisService,
+    user_id: uuid.UUID,
+    generation_id: str,
+) -> dict[str, Any] | None:
+    value = await redis.get(_generation_key(user_id, generation_id))
+    return value if isinstance(value, dict) else None
+
+
+async def get_ai_chat_generation_service(
+    *,
+    redis: RedisService,
+    current_user: User,
+    generation_id: str,
+) -> AIChatGenerationResponse:
+    """读取当前用户可恢复回答的最新生成快照。"""
+    key = _generation_key(current_user.id, generation_id)
+    value = await redis.get(key)
+    if not isinstance(value, dict):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=AIChatMsg.SESSION_NOT_FOUND,
+        )
+    return _generation_response(
+        generation_id=generation_id,
+        value=value,
+        ttl=await redis.ttl(key),
+    )
+
+
+async def cancel_ai_chat_generation_service(
+    *,
+    redis: RedisService,
+    current_user: User,
+    generation_id: str,
+) -> AIChatGenerationResponse:
+    """停止当前用户的可恢复 AI 回答，并保留终止前已经生成的内容。
+
+    1. 校验 generation 属于当前用户且快照仍存在
+    2. 写入独立取消标记，供正在运行的 worker 主动关闭上游流
+    3. 将快照推进到 cancelled 终态，确保刷新和重新进入时不会再次订阅
+    """
+    key = _generation_key(current_user.id, generation_id)
+    value = await redis.get(key)
+    if not isinstance(value, dict):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=AIChatMsg.SESSION_NOT_FOUND,
+        )
+
+    ttl = max(await redis.ttl(key), 1)
+    generation_status = _coerce_generation_status(value.get("status"))
+    if generation_status in {"queued", "thinking", "answering"}:
+        await redis.set(
+            _generation_cancelled_key(current_user.id, generation_id),
+            True,
+            ttl,
+        )
+        value["status"] = "cancelled"
+        value["error"] = None
+        value["revision"] = int(value.get("revision", 0)) + 1
+        await redis.set(key, value, ttl)
+
+    return _generation_response(
+        generation_id=generation_id,
+        value=value,
+        ttl=ttl,
+    )
+
+
+async def get_ai_chat_conversation_generation_service(
+    *,
+    session: Session,
+    redis: RedisService,
+    current_user: User,
+    conversation_id: uuid.UUID,
+) -> AIChatGenerationResponse:
+    """按最近对话 ID 找回当前或最近一次可恢复生成快照。"""
+    conversation = crud.get_ai_chat_conversation_for_user(
+        session,
+        conversation_id=conversation_id,
+        user_id=current_user.id,
+    )
+    if conversation is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=AIChatMsg.SESSION_NOT_FOUND,
+        )
+
+    generation_id = await redis.get(
+        RedisKey.ai_chat_conversation_generation(
+            str(current_user.id),
+            str(conversation_id),
+        )
+    )
+    if not isinstance(generation_id, str):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=AIChatMsg.SESSION_NOT_FOUND,
+        )
+    return await get_ai_chat_generation_service(
+        redis=redis,
+        current_user=current_user,
+        generation_id=generation_id,
+    )
+
+
+async def stream_ai_chat_generation_service(
+    *,
+    redis: RedisService,
+    current_user: User,
+    generation_id: str,
+    reasoning_offset: int = 0,
+    content_offset: int = 0,
+) -> AsyncIterator[str]:
+    """订阅后台生成快照，并从指定字符偏移继续输出 SSE 增量。
+
+    前端刷新后先读取 generation 详情恢复完整文本，再携带文本长度作为 offset
+    重新订阅，避免把已经展示的内容重复追加。
+    """
+    emitted_reasoning = max(reasoning_offset, 0)
+    emitted_content = max(content_offset, 0)
+    last_status: AIChatGenerationStatus | None = None
+    last_title: str | None = None
+
+    while True:
+        value = await _load_generation_value(
+            redis=redis,
+            user_id=current_user.id,
+            generation_id=generation_id,
+        )
+        if value is None:
+            yield _sse_event("error", {"message": AIChatMsg.SESSION_NOT_FOUND})
+            return
+
+        snapshot = _generation_response(
+            generation_id=generation_id,
+            value=value,
+            ttl=await redis.ttl(_generation_key(current_user.id, generation_id)),
+        )
+        if snapshot.status != last_status:
+            last_status = snapshot.status
+            yield _sse_event(
+                "status",
+                {
+                    "generation_id": generation_id,
+                    "session_id": snapshot.session_id,
+                    "status": snapshot.status,
+                },
+            )
+        if snapshot.title and snapshot.title != last_title:
+            last_title = snapshot.title
+            yield _sse_event(
+                "title",
+                {"session_id": snapshot.session_id, "title": snapshot.title},
+            )
+        if len(snapshot.reasoning_content) > emitted_reasoning:
+            delta = snapshot.reasoning_content[emitted_reasoning:]
+            emitted_reasoning = len(snapshot.reasoning_content)
+            yield _sse_event(
+                "reasoning",
+                {
+                    "content": delta,
+                    **_reasoning_payload_fields(snapshot.reasoning_content),
+                },
+            )
+        if len(snapshot.content) > emitted_content:
+            delta = snapshot.content[emitted_content:]
+            emitted_content = len(snapshot.content)
+            yield _sse_event("delta", {"content": delta})
+
+        if snapshot.status == "completed":
+            done_data: dict[str, Any] = {
+                "generation_id": generation_id,
+                "session_id": snapshot.session_id,
+                "message": snapshot.content,
+            }
+            if snapshot.reasoning_content:
+                done_data["reasoning"] = snapshot.reasoning_content
+                done_data.update(_reasoning_payload_fields(snapshot.reasoning_content))
+            yield _sse_event("done", done_data)
+            return
+        if snapshot.status == "cancelled":
+            return
+        if snapshot.status == "failed":
+            yield _sse_event(
+                "error",
+                {"message": snapshot.error or AIChatMsg.UPSTREAM_REQUEST_FAILED},
+            )
+            return
+
+        await asyncio.sleep(_GENERATION_POLL_INTERVAL_SECONDS)
+
+
+async def start_resumable_ai_chat_service(
+    *,
+    session: Session,
+    redis: RedisService,
+    current_user: User,
+    request: AIChatStreamRequest,
+) -> AsyncIterator[str]:
+    """创建后台生成任务并立即返回可重连的 SSE。
+
+    1. 校验或创建持久化会话占位，确保生成期间最近对话可见
+    2. 将完整请求与实时快照写入 Redis，Celery 消息只传轻量标识
+    3. 入队 worker 后复用 generation 订阅逻辑输出当前连接
+    """
+    conversation_id = _parse_conversation_id(request.session_id)
+    if request.session_id is not None and conversation_id is None:
+        yield _sse_event("error", {"message": AIChatMsg.SESSION_NOT_FOUND})
+        return
+
+    if conversation_id is None:
+        conversation_id = uuid.uuid4()
+        conversation = crud.create_ai_chat_conversation(
+            session,
+            conversation_id=conversation_id,
+            user_id=current_user.id,
+            title=_fallback_conversation_title(request.message, ""),
+        )
+    else:
+        existing_conversation = crud.get_ai_chat_conversation_for_user(
+            session,
+            conversation_id=conversation_id,
+            user_id=current_user.id,
+        )
+        if existing_conversation is None:
+            yield _sse_event("error", {"message": AIChatMsg.SESSION_NOT_FOUND})
+            return
+        conversation = existing_conversation
+
+    # 用户问题必须在任务入队前落库；即使 worker 尚未启动或页面立即刷新，
+    # 会话详情也能完整返回本轮提问。
+    user_attachments = _attachment_public_metadata(request.attachments)
+    crud.append_ai_chat_user_message(
+        session,
+        conversation=conversation,
+        content=request.message,
+        attachments=[attachment.model_dump() for attachment in user_attachments],
+    )
+
+    generation_id = uuid.uuid4().hex
+    worker_request = request.model_copy(
+        update={"session_id": str(conversation_id), "resumable": False}
+    )
+    initial_value: dict[str, Any] = {
+        "generation_id": generation_id,
+        "session_id": str(conversation_id),
+        "prompt": request.message,
+        "status": "queued",
+        "title": None,
+        "reasoning_content": "",
+        "content": "",
+        "error": None,
+        "revision": 0,
+    }
+    await redis.set(
+        _generation_key(current_user.id, generation_id),
+        initial_value,
+        _session_ttl(),
+    )
+    await redis.set(
+        _generation_request_key(current_user.id, generation_id),
+        worker_request.model_dump(mode="json"),
+        _session_ttl(),
+    )
+    await redis.set(
+        RedisKey.ai_chat_conversation_generation(
+            str(current_user.id),
+            str(conversation_id),
+        ),
+        generation_id,
+        _session_ttl(),
+    )
+
+    # 局部导入避免 task 注册时形成 service ↔ task 模块循环。
+    from app.tasks.ai_chat import generate_ai_chat_response_task
+
+    generate_ai_chat_response_task.delay(generation_id, str(current_user.id))
+    yield _sse_event(
+        "generation",
+        {
+            "generation_id": generation_id,
+            "session_id": str(conversation_id),
+        },
+    )
+    async for event in stream_ai_chat_generation_service(
+        redis=redis,
+        current_user=current_user,
+        generation_id=generation_id,
+    ):
+        yield event
 
 
 def _sse_event(event: str, data: dict[str, Any]) -> str:
@@ -729,6 +1074,8 @@ async def build_ai_chat_stream_request_from_multipart(
             "enable_thinking": _bool_form_value(
                 _first_form_value(form, "enable_thinking")
             ),
+            "resumable": _bool_form_value(_first_form_value(form, "resumable"))
+            or False,
         }
     except ValueError as exc:
         raise HTTPException(
@@ -801,22 +1148,23 @@ async def _save_history(
     user_message: str,
     user_attachments: list[AIChatAttachmentPublic],
     assistant_message: str,
+    user_message_persisted: bool = False,
 ) -> None:
-    """完整流式响应结束后再写入 Redis，避免保存半截 assistant 回复。"""
+    """写入本轮已产生的完整或手动终止前的 assistant 回复。"""
     if not assistant_message:
         return
 
-    next_history = _trim_history(
-        [
-            *history,
+    next_messages = [*history]
+    if not user_message_persisted:
+        next_messages.append(
             AIChatMessage(
                 role="user",
                 content=user_message,
                 attachments=user_attachments,
-            ),
-            AIChatMessage(role="assistant", content=assistant_message),
-        ]
-    )
+            )
+        )
+    next_messages.append(AIChatMessage(role="assistant", content=assistant_message))
+    next_history = _trim_history(next_messages)
     await redis.set(
         key,
         [_history_message_dump(message) for message in next_history],
@@ -1010,6 +1358,14 @@ def _openai_payload(
     return payload
 
 
+def _fast_answer_fallback_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """复用原请求上下文，关闭思考以补全被 reasoning 占满的正式回答。"""
+    return {
+        **payload,
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+
+
 def _openai_headers() -> dict[str, str]:
     headers = {
         "Accept": "text/event-stream",
@@ -1164,13 +1520,14 @@ async def stream_ai_chat_service(
     current_user: User,
     request: AIChatStreamRequest,
     session: Session | None = None,
+    user_message_persisted: bool = False,
 ) -> AsyncIterator[str]:
     """代理 OpenAI-compatible 流式对话。
 
     1. 确定或创建当前用户隔离的持久化会话 ID
     2. 优先从 PostgreSQL 读取历史，兼容旧 Redis 临时历史
     3. 将上游 data chunk 转换为前端 SSE 事件
-    4. 上游完整结束后再写回 user / assistant 历史
+    4. 正常结束或客户端手动终止时写回已产生的 user / assistant 历史
     """
     conversation_id = _parse_conversation_id(request.session_id)
     if session is not None:
@@ -1196,19 +1553,43 @@ async def stream_ai_chat_service(
     else:
         history = await _load_history(redis, redis_key)
 
+    request_history = history
+    if (
+        user_message_persisted
+        and history
+        and history[-1].role == "user"
+        and history[-1].content == request.message
+    ):
+        # 可恢复任务已在入队前写入当前 user 消息；模型历史需排除这条，
+        # 因为 _openai_payload() 会把本轮 request.message 再追加一次。
+        request_history = history[:-1]
+
     should_generate_title = (
-        session is not None and conversation_id is not None and not history
+        session is not None and conversation_id is not None and not request_history
     )
-    payload = _openai_payload(history, request)
+    payload = _openai_payload(request_history, request)
     user_attachments = _attachment_public_metadata(request.attachments)
     should_emit_reasoning = request.should_emit_reasoning
     assistant_chunks: list[str] = []
     reasoning_chunks: list[str] = []
     generated_title: str | None = None
+    stream_failed = False
+    stream_completed = False
 
     yield _sse_event("session", {"session_id": session_id})
 
     try:
+        if should_generate_title:
+            # 标题只依赖用户提问，先完成独立请求，避免在主回答流尚未读完时
+            # 再占用同一个本地模型服务连接。
+            generated_title = await _generate_conversation_title(
+                user_message=request.message,
+            )
+            yield _sse_event(
+                "title",
+                {"session_id": session_id, "title": generated_title},
+            )
+
         async for event, delta in _iter_openai_deltas(payload):
             if event == "reasoning":
                 reasoning_chunks.append(delta)
@@ -1231,58 +1612,83 @@ async def stream_ai_chat_service(
                     continue
                 delta = stripped_delta
 
-            if should_generate_title and generated_title is None:
-                # 上游开始返回 content 时，reasoning 已结束；标题只根据用户提问生成。
-                generated_title = await _generate_conversation_title(
-                    user_message=request.message,
-                )
-                yield _sse_event(
-                    "title",
-                    {"session_id": session_id, "title": generated_title},
-                )
-
             assistant_chunks.append(delta)
             yield _sse_event("delta", {"content": delta})
+
+        if not assistant_chunks and reasoning_chunks:
+            # oMLX 在思考输出被截断时，可能把相同分片同时放入 content 和
+            # reasoning_content。上面的去重会正确隐藏重复文本，但此时没有正式回答。
+            # 保留已经返回的思考过程，再用相同上下文关闭思考补全最终回答。
+            logger.warning("AI 思考流未返回正式回答，自动切换快速模式补全")
+            fallback_payload = _fast_answer_fallback_payload(payload)
+            async for event, delta in _iter_openai_deltas(fallback_payload):
+                if event != "delta":
+                    continue
+                assistant_chunks.append(delta)
+                yield _sse_event("delta", {"content": delta})
+        stream_completed = True
     except httpx.TimeoutException:
+        stream_failed = True
         logger.exception("AI 服务响应超时")
         yield _sse_event("error", {"message": AIChatMsg.UPSTREAM_TIMEOUT})
         return
     except httpx.HTTPError:
+        stream_failed = True
         logger.exception("AI 服务请求异常")
         yield _sse_event("error", {"message": AIChatMsg.UPSTREAM_REQUEST_FAILED})
         return
     except _AIChatUpstreamError as exc:
+        stream_failed = True
         logger.warning("AI 服务响应异常: %s", exc.message)
         yield _sse_event("error", {"message": exc.message})
         return
+    finally:
+        assistant_message = "".join(assistant_chunks)
+        reasoning_message = "".join(reasoning_chunks) if should_emit_reasoning else None
+        if assistant_message and not stream_failed:
+            if not stream_completed:
+                logger.info("客户端终止 AI 对话，保存终止前已生成的回复")
+            if session is not None and conversation_id is not None:
+                title = generated_title or _fallback_conversation_title(
+                    request.message,
+                    assistant_message,
+                )
+                if user_message_persisted:
+                    conversation = crud.get_ai_chat_conversation_for_user(
+                        session,
+                        conversation_id=conversation_id,
+                        user_id=current_user.id,
+                    )
+                    if conversation is not None:
+                        crud.append_ai_chat_assistant_message(
+                            session,
+                            conversation=conversation,
+                            content=assistant_message,
+                            reasoning_content=reasoning_message,
+                        )
+                else:
+                    crud.append_ai_chat_exchange(
+                        session,
+                        conversation_id=conversation_id,
+                        user_id=current_user.id,
+                        title=title,
+                        user_message=request.message,
+                        assistant_message=assistant_message,
+                        user_attachments=[
+                            attachment.model_dump() for attachment in user_attachments
+                        ],
+                        reasoning_content=reasoning_message,
+                    )
+            await _save_history(
+                redis=redis,
+                key=redis_key,
+                history=history,
+                user_message=request.message,
+                user_attachments=user_attachments,
+                assistant_message=assistant_message,
+                user_message_persisted=user_message_persisted,
+            )
 
-    assistant_message = "".join(assistant_chunks)
-    reasoning_message = "".join(reasoning_chunks) if should_emit_reasoning else None
-    if assistant_message and session is not None and conversation_id is not None:
-        title = generated_title or _fallback_conversation_title(
-            request.message,
-            assistant_message,
-        )
-        crud.append_ai_chat_exchange(
-            session,
-            conversation_id=conversation_id,
-            user_id=current_user.id,
-            title=title,
-            user_message=request.message,
-            assistant_message=assistant_message,
-            user_attachments=[
-                attachment.model_dump() for attachment in user_attachments
-            ],
-            reasoning_content=reasoning_message,
-        )
-    await _save_history(
-        redis=redis,
-        key=redis_key,
-        history=history,
-        user_message=request.message,
-        user_attachments=user_attachments,
-        assistant_message=assistant_message,
-    )
     done_data: dict[str, Any] = {
         "session_id": session_id,
         "message": assistant_message,

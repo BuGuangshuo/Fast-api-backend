@@ -10,6 +10,14 @@ from pydantic import BaseModel, Field
 
 AIChatThinkingMode = Literal["auto", "thinking", "fast"]
 AIChatSearchType = Literal["conversation", "document"]
+AIChatGenerationStatus = Literal[
+    "queued",
+    "thinking",
+    "answering",
+    "completed",
+    "cancelled",
+    "failed",
+]
 
 
 class AIChatAttachmentPublic(BaseModel):
@@ -60,6 +68,10 @@ class AIChatStreamRequest(BaseModel):
         default=None,
         description="兼容旧前端的思考开关；新前端请改用 thinking_mode",
     )
+    resumable: bool = Field(
+        default=False,
+        description="是否启用刷新后可恢复的后台生成模式",
+    )
     attachments: list[AIChatAttachment] = Field(
         default_factory=list,
         description="本轮随消息上传的附件，历史中仅保留文件名、类型和大小",
@@ -100,6 +112,21 @@ class AIChatSessionResponse(BaseModel):
     messages: list[AIChatMessage] = Field(description="会话消息历史")
     ttl: int = Field(description="会话剩余有效秒数")
     title: str | None = Field(default=None, description="持久化会话标题")
+
+
+class AIChatGenerationResponse(BaseModel):
+    """可恢复 AI 回答的当前生成快照。"""
+
+    generation_id: str = Field(description="生成任务 ID")
+    session_id: str = Field(description="所属持久化会话 ID")
+    prompt: str = Field(default="", description="触发本轮生成的用户提问")
+    status: AIChatGenerationStatus = Field(description="当前生成阶段")
+    title: str | None = Field(default=None, description="自动生成的会话标题")
+    reasoning_content: str = Field(default="", description="当前已生成的思考内容")
+    content: str = Field(default="", description="当前已生成的正式回答")
+    error: str | None = Field(default=None, description="失败时的用户侧错误信息")
+    revision: int = Field(default=0, ge=0, description="快照修订号")
+    ttl: int = Field(description="快照剩余有效秒数")
 
 
 # ==================== Persistent Conversation Schemas ====================
